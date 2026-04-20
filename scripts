@@ -33,3 +33,400 @@ sudo amnezia-route-refresh-domains
 Посмотреть список доменов можно так:
 
 cat /etc/amzroute/domains.list
+
+
+Скрипты будут установлены в:
+
+/usr/local/sbin/amnezia-route-refresh-domains
+/usr/local/sbin/amnezia-route-refresh-ipfiles
+/usr/local/sbin/amnezia-route-apply
+/usr/local/sbin/amnezia-route-add-domain
+/usr/local/sbin/amnezia-route-add-ipfile
+
+И данные будут храниться в:
+
+/etc/amzroute/domains.list
+/etc/amzroute/ipfiles.list
+/etc/amzroute/ipsets/
+
+Сначала создай каталоги:
+
+sudo mkdir -p /etc/amzroute/ipsets /usr/local/sbin /var/backups/amzroute
+sudo touch /etc/amzroute/domains.list /etc/amzroute/ipfiles.list
+sudo chmod 755 /etc/amzroute /etc/amzroute/ipsets
+
+Теперь установи amnezia-route-refresh-domains:
+
+sudo tee /usr/local/sbin/amnezia-route-refresh-domains > /dev/null <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+DOMAINS_FILE="/etc/amzroute/domains.list"
+OUT_FILE="/etc/nftables.d/12-amzroute-domains-generated.nft"
+TMP_FILE="$(mktemp)"
+BACKUP_DIR="/var/backups/amzroute"
+TABLE="inet amzroute"
+
+mkdir -p "$BACKUP_DIR"
+mkdir -p /etc/nftables.d
+
+mapfile -t DOMAINS < <(
+  sed 's/[[:space:]]*#.*$//' "$DOMAINS_FILE" 2>/dev/null \
+  | sed '/^[[:space:]]*$/d' \
+  | tr '[:upper:]' '[:lower:]' \
+  | sort -u
+)
+
+declare -a IPV4=()
+declare -a IPV6=()
+
+for d in "${DOMAINS[@]:-}"; do
+  while read -r ip; do
+    [[ -n "$ip" ]] && IPV4+=("$ip")
+  done < <(getent ahostsv4 "$d" 2>/dev/null | awk '{print $1}' | sort -u)
+
+  while read -r ip; do
+    [[ -n "$ip" ]] && IPV6+=("$ip")
+  done < <(getent ahostsv6 "$d" 2>/dev/null | awk '{print $1}' | sort -u)
+done
+
+mapfile -t IPV4 < <(printf '%s\n' "${IPV4[@]:-}" | sed '/^$/d' | sort -Vu | uniq)
+mapfile -t IPV6 < <(printf '%s\n' "${IPV6[@]:-}" | sed '/^$/d' | sort -Vu | uniq)
+
+{
+  echo "table $TABLE {"
+  echo "    set de_domains4 {"
+  echo "        type ipv4_addr"
+  echo "        flags interval"
+  if ((${#IPV4[@]})); then
+    echo -n "        elements = { "
+    printf '%s, ' "${IPV4[@]}" | sed 's/, $//'
+    echo " }"
+  fi
+  echo "    }"
+  echo
+  echo "    set de_domains6 {"
+  echo "        type ipv6_addr"
+  echo "        flags interval"
+  if ((${#IPV6[@]})); then
+    echo -n "        elements = { "
+    printf '%s, ' "${IPV6[@]}" | sed 's/, $//'
+    echo " }"
+  fi
+  echo "    }"
+  echo "}"
+} > "$TMP_FILE"
+
+if [[ -f "$OUT_FILE" ]]; then
+  cp -a "$OUT_FILE" "$BACKUP_DIR/$(basename "$OUT_FILE").$(date +%F_%H-%M-%S).bak"
+fi
+
+mv "$TMP_FILE" "$OUT_FILE"
+chmod 644 "$OUT_FILE"
+
+echo "[ok] refreshed domain route sets"
+echo "IPv4 count: ${#IPV4[@]}"
+echo "IPv6 count: ${#IPV6[@]}"
+EOF
+
+sudo chmod +x /usr/local/sbin/amnezia-route-refresh-domains
+
+Теперь amnezia-route-refresh-ipfiles:
+
+sudo tee /usr/local/sbin/amnezia-route-refresh-ipfiles > /dev/null <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+IPFILES_LIST="/etc/amzroute/ipfiles.list"
+OUT_FILE="/etc/nftables.d/11-amzroute-ipfiles-generated.nft"
+TMP_V4="$(mktemp)"
+TMP_V6="$(mktemp)"
+TMP_OUT="$(mktemp)"
+BACKUP_DIR="/var/backups/amzroute"
+TABLE="inet amzroute"
+
+mkdir -p "$BACKUP_DIR"
+mkdir -p /etc/nftables.d
+
+mapfile -t FILES < <(
+  sed 's/[[:space:]]*#.*$//' "$IPFILES_LIST" 2>/dev/null \
+  | sed '/^[[:space:]]*$/d' \
+  | sort -u
+)
+
+for f in "${FILES[@]:-}"; do
+  [[ -f "$f" ]] || continue
+
+  sed 's/[[:space:]]*#.*$//' "$f" \
+    | sed '/^[[:space:]]*$/d' \
+    | while read -r line; do
+        val="$(echo "$line" | xargs)"
+        [[ -z "$val" ]] && continue
+        if [[ "$val" == *:* ]]; then
+          echo "$val" >> "$TMP_V6"
+        else
+          echo "$val" >> "$TMP_V4"
+        fi
+      done
+done
+
+sort -Vu "$TMP_V4" | uniq > "${TMP_V4}.sorted"
+sort -Vu "$TMP_V6" | uniq > "${TMP_V6}.sorted"
+
+V4_COUNT="$(wc -l < "${TMP_V4}.sorted" | tr -d ' ')"
+V6_COUNT="$(wc -l < "${TMP_V6}.sorted" | tr -d ' ')"
+
+{
+  echo "table $TABLE {"
+  echo "    set de_manual4 {"
+  echo "        type ipv4_addr"
+  echo "        flags interval"
+  if [[ "$V4_COUNT" != "0" ]]; then
+    echo -n "        elements = { "
+    paste -sd', ' "${TMP_V4}.sorted"
+    echo " }"
+  fi
+  echo "    }"
+  echo
+  echo "    set de_manual6 {"
+  echo "        type ipv6_addr"
+  echo "        flags interval"
+  if [[ "$V6_COUNT" != "0" ]]; then
+    echo -n "        elements = { "
+    paste -sd', ' "${TMP_V6}.sorted"
+    echo " }"
+  fi
+  echo "    }"
+  echo "}"
+} > "$TMP_OUT"
+
+if [[ -f "$OUT_FILE" ]]; then
+  cp -a "$OUT_FILE" "$BACKUP_DIR/$(basename "$OUT_FILE").$(date +%F_%H-%M-%S).bak"
+fi
+
+mv "$TMP_OUT" "$OUT_FILE"
+chmod 644 "$OUT_FILE"
+
+rm -f "$TMP_V4" "$TMP_V6" "${TMP_V4}.sorted" "${TMP_V6}.sorted"
+
+echo "[ok] refreshed ipfile route sets"
+echo "IPv4 count: $V4_COUNT"
+echo "IPv6 count: $V6_COUNT"
+EOF
+
+sudo chmod +x /usr/local/sbin/amnezia-route-refresh-ipfiles
+
+Теперь amnezia-route-apply:
+
+sudo tee /usr/local/sbin/amnezia-route-apply > /dev/null <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+NFT_CONF="/etc/nftables.conf"
+
+nft -c -f "$NFT_CONF"
+nft -f "$NFT_CONF"
+systemctl restart nftables
+
+echo "[ok] nftables config validated and applied"
+EOF
+
+sudo chmod +x /usr/local/sbin/amnezia-route-apply
+
+Теперь amnezia-route-add-domain:
+
+sudo tee /usr/local/sbin/amnezia-route-add-domain > /dev/null <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+DOMAINS_FILE="/etc/amzroute/domains.list"
+
+[[ $# -eq 1 ]] || {
+  echo "usage: sudo amnezia-route-add-domain <domain>"
+  exit 1
+}
+
+DOMAIN="$(echo "$1" | tr '[:upper:]' '[:lower:]' | xargs)"
+
+if [[ -z "$DOMAIN" ]]; then
+  echo "empty domain"
+  exit 1
+fi
+
+touch "$DOMAINS_FILE"
+
+if grep -Fqx "$DOMAIN" "$DOMAINS_FILE"; then
+  echo "[ok] domain already exists: $DOMAIN"
+  exit 0
+fi
+
+echo "$DOMAIN" >> "$DOMAINS_FILE"
+sort -u -o "$DOMAINS_FILE" "$DOMAINS_FILE"
+
+echo "[ok] added domain: $DOMAIN"
+echo "run: sudo amnezia-route-refresh-domains"
+EOF
+
+sudo chmod +x /usr/local/sbin/amnezia-route-add-domain
+
+Теперь amnezia-route-add-ipfile:
+
+sudo tee /usr/local/sbin/amnezia-route-add-ipfile > /dev/null <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+IPFILES_LIST="/etc/amzroute/ipfiles.list"
+
+[[ $# -eq 1 ]] || {
+  echo "usage: sudo amnezia-route-add-ipfile <absolute-path-to-file>"
+  exit 1
+}
+
+FILE="$1"
+
+if [[ ! -f "$FILE" ]]; then
+  echo "file not found: $FILE"
+  exit 1
+fi
+
+touch "$IPFILES_LIST"
+
+if grep -Fqx "$FILE" "$IPFILES_LIST"; then
+  echo "[ok] ipfile already exists: $FILE"
+  exit 0
+fi
+
+echo "$FILE" >> "$IPFILES_LIST"
+sort -u -o "$IPFILES_LIST" "$IPFILES_LIST"
+
+echo "[ok] added ipfile: $FILE"
+echo "run: sudo amnezia-route-refresh-ipfiles"
+EOF
+
+sudo chmod +x /usr/local/sbin/amnezia-route-add-ipfile
+
+Теперь проверь, что базовый nftables-конфиг у тебя действительно включает каталог /etc/nftables.d/*.nft:
+
+sudo sed -n '1,80p' /etc/nftables.conf
+
+В нём должно быть что-то вроде:
+
+#!/usr/sbin/nft -f
+flush ruleset
+include "/etc/nftables.d/*.nft"
+
+Если у тебя этого нет, замени на такой минимальный вариант:
+
+sudo tee /etc/nftables.conf > /dev/null <<'EOF'
+#!/usr/sbin/nft -f
+flush ruleset
+
+include "/etc/nftables.d/*.nft"
+EOF
+
+Теперь создай пример базовой таблицы amzroute, если она уже не описана отдельным .nft файлом:
+
+sudo tee /etc/nftables.d/10-amzroute-base.nft > /dev/null <<'EOF'
+table inet amzroute {
+    chain output {
+        type route hook output priority mangle; policy accept;
+        ip daddr @de_dst4 meta mark set 0x00000064
+        ip daddr @de_manual4 meta mark set 0x00000064
+        ip daddr @de_domains4 meta mark set 0x00000064
+
+        ip6 daddr @de_dst6 meta mark set 0x00000064
+        ip6 daddr @de_manual6 meta mark set 0x00000064
+        ip6 daddr @de_domains6 meta mark set 0x00000064
+    }
+
+    chain prerouting {
+        type filter hook prerouting priority mangle; policy accept;
+        ip daddr @de_dst4 meta mark set 0x00000064
+        ip daddr @de_manual4 meta mark set 0x00000064
+        ip daddr @de_domains4 meta mark set 0x00000064
+
+        ip6 daddr @de_dst6 meta mark set 0x00000064
+        ip6 daddr @de_manual6 meta mark set 0x00000064
+        ip6 daddr @de_domains6 meta mark set 0x00000064
+    }
+
+    set de_dst4 {
+        type ipv4_addr
+        flags interval
+    }
+
+    set de_dst6 {
+        type ipv6_addr
+        flags interval
+    }
+
+    set de_manual4 {
+        type ipv4_addr
+        flags interval
+    }
+
+    set de_manual6 {
+        type ipv6_addr
+        flags interval
+    }
+
+    set de_domains4 {
+        type ipv4_addr
+        flags interval
+    }
+
+    set de_domains6 {
+        type ipv6_addr
+        flags interval
+    }
+}
+EOF
+
+Теперь можно сразу пользоваться.
+
+Добавить домены OpenAI:
+
+sudo amnezia-route-add-domain chatgpt.com
+sudo amnezia-route-add-domain openai.com
+sudo amnezia-route-add-domain oaistatic.com
+sudo amnezia-route-add-domain oaiusercontent.com
+
+Обновить резолв доменов и применить:
+
+sudo amnezia-route-refresh-domains
+sudo amnezia-route-apply
+
+Пример IP-файла:
+
+sudo tee /etc/amzroute/ipsets/googlevideo.txt > /dev/null <<'EOF'
+# one IP or CIDR per line
+8.8.8.8
+8.8.4.0/24
+2001:4860:4860::8888
+EOF
+
+Добавить этот файл в список и применить:
+
+sudo amnezia-route-add-ipfile /etc/amzroute/ipsets/googlevideo.txt
+sudo amnezia-route-refresh-ipfiles
+sudo amnezia-route-apply
+
+Посмотреть, что в списках:
+
+cat /etc/amzroute/domains.list
+cat /etc/amzroute/ipfiles.list
+
+Посмотреть сгенерированные nft-файлы:
+
+sudo sed -n '1,200p' /etc/nftables.d/11-amzroute-ipfiles-generated.nft
+sudo sed -n '1,200p' /etc/nftables.d/12-amzroute-domains-generated.nft
+
+Посмотреть итоговый ruleset:
+
+sudo nft list ruleset
+
+Полезный ручной цикл обновления:
+
+sudo amnezia-route-refresh-domains
+sudo amnezia-route-refresh-ipfiles
+sudo amnezia-route-apply
