@@ -1,1 +1,35 @@
+Пример:
 
+Добавить OpenAI-домен:
+
+sudo amnezia-route-add-domain openai.com
+sudo amnezia-route-refresh-domains
+
+Добавить файл с сетями Googlevideo:
+
+sudo amnezia-route-add-ipfile /root/googlevideo.txt
+sudo amnezia-route-refresh-ipfiles
+
+2) Если хочешь добавить файл с IP-адресами или подсетями
+
+Тогда нужен отдельный файл, и его надо подключать через:
+
+sudo amnezia-route-add-ipfile /путь/к/файлу.txt
+sudo amnezia-route-refresh-ipfiles
+
+После этого путь к файлу попадёт в конфиг ipfiles, а сами IP будут читаться из этого файла.
+
+1) Если хочешь добавить домен
+
+Используй утилиту:
+
+sudo amnezia-route-add-domain example.com
+sudo amnezia-route-refresh-domains
+
+Это добавит домен в:
+
+/etc/amzroute/domains.list
+
+Посмотреть список доменов можно так:
+
+cat /etc/amzroute/domains.list
